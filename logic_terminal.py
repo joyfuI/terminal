@@ -10,7 +10,6 @@ import fcntl
 import termios
 from shlex import split
 
-import psutil
 from flask import request, render_template, jsonify
 
 from plugin import LogicModuleBase
@@ -55,20 +54,6 @@ class LogicTerminal(LogicModuleBase):
             logger.error(traceback.format_exc())
             return render_template('sample.html', title=f'{package_name} - {sub}')
 
-    def process_ajax(self, sub, req):
-        try:
-            logger.debug('AJAX: %s, %s', sub, req.values)
-            ret = {'ret': 'success'}
-
-            if sub == 'test':
-                pass
-
-            return jsonify(ret)
-        except Exception as e:
-            logger.error('Exception:%s', e)
-            logger.error(traceback.format_exc())
-            return jsonify({'ret': 'danger', 'msg': str(e)})
-
     # 터미널 실행
     @staticmethod
     @socketio.on('connect', namespace=f'/{package_name}/{name}')
@@ -77,17 +62,14 @@ class LogicTerminal(LogicModuleBase):
             logger.debug('socketio: /%s/%s, connect, %s',
                          package_name, name, request.sid)
             cmd = split(ModelSetting.get(f'{name}_shell'))
-            (pid, fd) = pty.fork()  # 자식 프로세스 생성
-            if pid == 0:
-                # 자식 프로세스
-                subprocess.run(cmd)  # 셸 실행
-            else:
-                # 부모 프로세스
-                logger.debug('cmd: %s, child pid: %s', cmd, pid)
-                LogicTerminal.pty_list[request.sid] = {'pid': pid, 'fd': fd}
-                LogicTerminal.set_winsize(fd, 50, 50)
-                socketio.start_background_task(
-                    LogicTerminal.output_emit, fd, request.sid)
+            (master, slave) = pty.openpty()  # 터미널 생성
+            popen = subprocess.Popen(
+                cmd, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)  # 셸 실행
+            logger.debug('cmd: %s, child pid: %s', cmd, popen.pid)
+            LogicTerminal.pty_list[request.sid] = {
+                'popen': popen, 'master': master, 'slave': slave}
+            socketio.start_background_task(
+                LogicTerminal.output_emit, master, request.sid)
         except Exception as e:
             logger.error('Exception:%s', e)
             logger.error(traceback.format_exc())
@@ -99,11 +81,11 @@ class LogicTerminal(LogicModuleBase):
         try:
             logger.debug('socketio: /%s/%s, disconnect, %s',
                          package_name, name, request.sid)
-            parent = psutil.Process(LogicTerminal.pty_list[request.sid]['pid'])
-            for child in parent.children(recursive=True):
-                child.kill()
-            parent.kill()
-            os.close(LogicTerminal.pty_list[request.sid]['fd'])
+            popen = LogicTerminal.pty_list[request.sid]['popen']
+            if popen.poll():
+                popen.kill()
+            os.close(LogicTerminal.pty_list[request.sid]['master'])
+            os.close(LogicTerminal.pty_list[request.sid]['slave'])
             del LogicTerminal.pty_list[request.sid]
         except Exception as e:
             logger.error('Exception:%s', e)
@@ -116,7 +98,7 @@ class LogicTerminal(LogicModuleBase):
         try:
             logger.debug('socketio: /%s/%s, input, %s, %s',
                          package_name, name, request.sid, data)
-            fd = LogicTerminal.pty_list[request.sid]['fd']
+            fd = LogicTerminal.pty_list[request.sid]['master']
             os.write(fd, base64.b64decode(data))
         except Exception as e:
             logger.error('Exception:%s', e)
@@ -129,7 +111,7 @@ class LogicTerminal(LogicModuleBase):
         try:
             logger.debug('socketio: /%s/%s, resize, %s, %s',
                          package_name, name, request.sid, data)
-            fd = LogicTerminal.pty_list[request.sid]['fd']
+            fd = LogicTerminal.pty_list[request.sid]['master']
             LogicTerminal.set_winsize(fd, data['rows'], data['cols'])
         except Exception as e:
             logger.error('Exception:%s', e)
@@ -142,14 +124,10 @@ class LogicTerminal(LogicModuleBase):
             max_read_bytes = 1024 * 20
             while True:
                 socketio.sleep(0.01)
-                if fd:
-                    timeout_sec = 0
-                    (data_ready, _, _) = select.select(
-                        [fd], [], [], timeout_sec)
-                    if data_ready:
-                        output = os.read(fd, max_read_bytes).decode()
-                        socketio.emit(
-                            'output', output, namespace=f'/{package_name}/{name}', room=room)
+                if select.select([fd], [], [], 0)[0]:
+                    output = os.read(fd, max_read_bytes).decode()
+                    socketio.emit(
+                        'output', output, namespace=f'/{package_name}/{name}', room=room)
         except OSError as e:    # 터미널 종료
             pass
         except Exception as e:
